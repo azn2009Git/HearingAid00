@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Listen">
+<meta name="theme-color" content="#0b1e3a">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>Listen</title>
+<style>
+  :root { --bg:#0b1e3a; --fg:#ffffff; --on:#1faa59; --off:#c0392b; --accent:#ffd23f; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; -webkit-user-select:none; user-select:none; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system, system-ui, sans-serif; overflow:hidden; touch-action:manipulation; }
+  main { height:100%; display:flex; flex-direction:column; align-items:center; justify-content:space-between;
+    padding:max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom)); }
+  h1 { font-size:2rem; margin:0; text-align:center; }
+  #status { font-size:1.6rem; text-align:center; min-height:2.2em; }
+  #power { width:min(70vw,260px); height:min(70vw,260px); border-radius:50%; border:8px solid #fff;
+    background:var(--off); color:#fff; font-size:2.4rem; font-weight:800; cursor:pointer;
+    box-shadow:0 8px 24px rgba(0,0,0,.5); transition:transform .1s, background .2s; }
+  #power.on { background:var(--on); }
+  #power:active { transform:scale(.93); }
+  .volume { width:100%; max-width:480px; text-align:center; }
+  .volume label { font-size:1.8rem; display:block; margin-bottom:12px; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .step { flex:0 0 auto; width:76px; height:76px; border-radius:50%; border:4px solid #fff; background:transparent;
+    color:#fff; font-size:3rem; font-weight:700; line-height:1; }
+  .step:active { background:rgba(255,255,255,.25); }
+  input[type=range] { -webkit-appearance:none; appearance:none; flex:1; height:64px; background:transparent; }
+  input[type=range]::-webkit-slider-runnable-track { height:28px; border-radius:14px; background:#3b557d; border:3px solid #fff; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:72px; height:72px; margin-top:-30px;
+    border-radius:50%; background:var(--accent); border:4px solid #fff; box-shadow:0 3px 10px rgba(0,0,0,.5); }
+  #meter { width:100%; max-width:480px; height:22px; border-radius:11px; background:#16294a; overflow:hidden; border:2px solid #3b557d; }
+  #meterfill { height:100%; width:0%; background:linear-gradient(90deg,#1faa59,#ffd23f 70%,#e74c3c); transition:width .06s linear; }
+  #hint { font-size:1.1rem; opacity:.8; text-align:center; max-width:480px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Listen</h1>
+  <div id="status" aria-live="polite">Tap the big button to start</div>
+  <button id="power" aria-label="Turn on or off">START</button>
+  <div id="meter" aria-hidden="true"><div id="meterfill"></div></div>
+  <div class="volume">
+    <label for="vol">Volume</label>
+    <div class="row">
+      <button class="step" id="down" aria-label="Quieter">&minus;</button>
+      <input type="range" id="vol" min="0" max="100" value="20" step="1">
+      <button class="step" id="up" aria-label="Louder">+</button>
+    </div>
+  </div>
+  <div id="hint">Wear your earbuds. Keep the phone a little away from your ears.</div>
+</main>
+
+<script>
+(() => {
+  const MAX_GAIN = 6;            // hard safety cap (~ +15 dB)
+  const $ = id => document.getElementById(id);
+  const power = $('power'), statusEl = $('status'), vol = $('vol'), fill = $('meterfill');
+
+  let ctx, stream, src, gain, comp, analyser, raf, wakeLock, running = false;
+
+  const sliderToGain = v => (v / 100) * MAX_GAIN;
+  const say = t => statusEl.textContent = t;
+  const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
+
+  // Restore last volume (nice-to-have; ignore if storage unavailable)
+  const saved = safe(() => localStorage.getItem('vol'));
+  if (saved !== null && saved !== undefined) vol.value = Math.min(60, Math.max(0, +saved || 20)); // restart at moderate level at most
+
+  function applyVolume() {
+    safe(() => localStorage.setItem('vol', vol.value));
+    if (gain) gain.gain.setTargetAtTime(sliderToGain(+vol.value), ctx.currentTime, 0.03);
+  }
+  vol.addEventListener('input', applyVolume);
+  $('down').onclick = () => { vol.value = Math.max(0, +vol.value - 10); applyVolume(); };
+  $('up').onclick   = () => { vol.value = Math.min(100, +vol.value + 10); applyVolume(); };
+
+  async function start() {
+    say('Starting…');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1
+        }
+      });
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ctx = new AC({ latencyHint: 'interactive' });
+      await ctx.resume();
+
+      src = ctx.createMediaStreamSource(stream);
+      gain = ctx.createGain();
+      gain.gain.value = 0;                       // start silent, ramp up
+      comp = ctx.createDynamicsCompressor();     // safety limiter
+      comp.threshold.value = -18;
+      comp.knee.value = 6;
+      comp.ratio.value = 12;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.15;
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+
+      src.connect(gain);
+      gain.connect(comp);
+      comp.connect(ctx.destination);
+      src.connect(analyser);                     // meter shows input level
+
+      applyVolume();
+      running = true;
+      power.textContent = 'STOP';
+      power.classList.add('on');
+      say('Listening…');
+      drawMeter();
+      safe(async () => { wakeLock = await navigator.wakeLock.request('screen'); });
+      stream.getAudioTracks()[0].addEventListener('ended', () => stop('Microphone lost. Tap START.'));
+    } catch (err) {
+      console.error(err);
+      stop(err && err.name === 'NotAllowedError'
+        ? 'Microphone blocked. Ask for help to allow it in Settings.'
+        : 'Could not start. Tap START to try again.');
+    }
+  }
+
+  function stop(msg) {
+    running = false;
+    cancelAnimationFrame(raf);
+    fill.style.width = '0%';
+    safe(() => stream && stream.getTracks().forEach(t => t.stop()));
+    safe(() => ctx && ctx.close());
+    safe(() => wakeLock && wakeLock.release());
+    ctx = stream = src = gain = comp = analyser = wakeLock = null;
+    power.textContent = 'START';
+    power.classList.remove('on');
+    say(msg || 'Stopped. Tap START to listen.');
+  }
+
+  function drawMeter() {
+    const buf = new Uint8Array(analyser.fftSize);
+    const loop = () => {
+      if (!running) return;
+      analyser.getByteTimeDomainData(buf);
+      let peak = 0;
+      for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+      fill.style.width = Math.min(100, peak * 250) + '%';
+      raf = requestAnimationFrame(loop);
+    };
+    loop();
+  }
+
+  power.onclick = () => running ? stop() : start();
+
+  // iOS suspends audio when backgrounded; resume or stop cleanly when she returns.
+  document.addEventListener('visibilitychange', async () => {
+    if (!running) return;
+    if (document.visibilityState === 'visible') {
+      safe(async () => { if (ctx.state !== 'running') await ctx.resume(); });
+      safe(async () => { wakeLock = await navigator.wakeLock.request('screen'); });
+    }
+  });
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+})();
+</script>
+</body>
+</html>
